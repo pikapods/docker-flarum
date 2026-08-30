@@ -1,0 +1,68 @@
+name: flarum
+
+services:
+  mariadb:
+    image: mariadb:11
+    command:
+      - "mariadbd"
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_unicode_ci"
+    environment:
+      MARIADB_DATABASE: flarum
+      MARIADB_USER: flarum
+      MARIADB_PASSWORD: changeme          # change before any real deployment
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  flarum:
+    image: ${FLARUM_IMAGE:-ghcr.io/pikapods/docker-flarum:latest}
+    build:
+      context: .
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      # FLARUM_BASE_URL is mandatory — the image refuses to boot without it,
+      # and Flarum bakes it into generated asset/redirect URLs.
+      FLARUM_BASE_URL: http://localhost:8000
+      FLARUM_FORUM_TITLE: "My Flarum Forum"
+      DB_HOST: mariadb
+      DB_NAME: flarum
+      DB_USER: flarum
+      DB_PASSWORD: changeme
+    volumes:
+      - flarum-data:/data
+    ports:
+      - "${FLARUM_HTTP_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  # Flarum's scheduler (mail digests, extension jobs) is not driven by web
+  # requests. SIDECAR_CRON=1 makes this second container run crond against the
+  # same /data instead of nginx/php-fpm.
+  cron:
+    image: ${FLARUM_IMAGE:-ghcr.io/pikapods/docker-flarum:latest}
+    depends_on:
+      - flarum
+    environment:
+      FLARUM_BASE_URL: http://localhost:8000
+      DB_HOST: mariadb
+      DB_NAME: flarum
+      DB_USER: flarum
+      DB_PASSWORD: changeme
+      SIDECAR_CRON: "1"
+      CRON_SCHEDULE: "* * * * *"
+    volumes:
+      - flarum-data:/data
+    restart: unless-stopped
+
+volumes:
+  mariadb-data:
+  flarum-data:

@@ -1,51 +1,361 @@
-name: build
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
+name: Build and publish
 
 on:
+  workflow_dispatch:
+    inputs:
+      flarum_version:
+        description: "Flarum version, no leading v (e.g. 1.8.18)"
+        required: true
+        type: string
+      alpine_version:
+        description: "Alpine series of the crazymax/alpine-s6 base"
+        required: false
+        default: "3.23"
+        type: string
+      publish:
+        description: "Publish to GHCR + Docker Hub after tests pass"
+        required: false
+        default: true
+        type: boolean
+      base_digest:
+        description: "sha256 of the base image to pin (optional; resolved on-demand otherwise)"
+        required: false
+        default: ""
+        type: string
+      revision:
+        description: "Manual revision override (e.g. r1). Otherwise computed by reading the prior published label."
+        required: false
+        default: ""
+        type: string
   push:
-    branches:
-      - 'master'
     tags:
-      - '*'
-  pull_request:
+      - "v*"
+
+# Serialize builds so revision computation can't race itself: two concurrent
+# runs against the same FLARUM_VERSION would otherwise both read 'r2' and both
+# write 'r3'. With concurrency: build, the second run reads the first's
+# freshly-pushed label and computes the next number correctly.
+concurrency: build
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
-    uses: docker/github-builder/.github/workflows/bake.yml@c4a1b216d96a8c85b45a9974b37857828274c808 # v1.13.0
+    runs-on: ubuntu-latest
     permissions:
-      contents: read # same as global permissions
-      id-token: write # for signing attestation(s) with GitHub OIDC Token
-      packages: write # required to push to GHCR
-    with:
-      setup-qemu: true
-      target: image-all
-      cache: true
-      cache-scope: build
-      output: image
-      push: ${{ github.event_name != 'pull_request' }}
-      set-meta-labels: true
-      meta-images: |
-        crazymax/flarum
-        ghcr.io/crazy-max/flarum
-      meta-tags: |
-        type=match,pattern=(.*)-r,group=1
-        type=ref,event=pr
-        type=edge
-      meta-labels: |
-        org.opencontainers.image.title=Flarum
-        org.opencontainers.image.description=Flarum simple forum
-        org.opencontainers.image.vendor=CrazyMax
-    secrets:
-      registry-auths: |
-        - registry: docker.io
-          username: ${{ vars.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-        - registry: ghcr.io
-          username: ${{ github.repository_owner }}
+      contents: read
+      packages: read
+    outputs:
+      flarum_version: ${{ steps.vars.outputs.flarum_version }}
+      alpine_version: ${{ steps.vars.outputs.alpine_version }}
+      build_date: ${{ steps.vars.outputs.build_date }}
+      revision: ${{ steps.revision.outputs.revision }}
+      base_digest: ${{ steps.base.outputs.base_digest }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve build args
+        id: vars
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FLARUM_VER="${{ inputs.flarum_version }}"
+            ALPINE_VER="${{ inputs.alpine_version }}"
+          else
+            # Tag form: v<flarum-version> (e.g. v1.8.18)
+            FLARUM_VER="${GITHUB_REF_NAME#v}"
+            ALPINE_VER="3.23"
+          fi
+          # Normalise away a leading "v" so the arg, the image tag and the
+          # image.version label are all the same plain semver.
+          FLARUM_VER="${FLARUM_VER#v}"
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "flarum_version=$FLARUM_VER" >>"$GITHUB_OUTPUT"
+          echo "alpine_version=$ALPINE_VER" >>"$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE"     >>"$GITHUB_OUTPUT"
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Resolve base image digest
+        id: base
+        env:
+          ALPINE_VER: ${{ steps.vars.outputs.alpine_version }}
+          INPUT_DIGEST: ${{ inputs.base_digest }}
+        run: |
+          set -euo pipefail
+          # The -2.2.0.3 suffix is s6-overlay v2 and is load-bearing: every
+          # script under rootfs/ targets /etc/cont-init.d. Do not float it to
+          # the 3.x line without rewriting the init tree.
+          BASE_REF="crazymax/alpine-s6:${ALPINE_VER}-2.2.0.3"
+          if [ -n "${INPUT_DIGEST}" ]; then
+            digest="${INPUT_DIGEST}"
+            echo "using digest provided by caller: ${digest}"
+          else
+            digest=$(crane digest "${BASE_REF}")
+            echo "resolved current digest: ${digest}"
+          fi
+          echo "base_digest=${digest}" >>"$GITHUB_OUTPUT"
+          echo "base_image=${BASE_REF}@${digest}" >>"$GITHUB_OUTPUT"
+
+      - name: Compute image revision
+        id: revision
+        env:
+          FLARUM_VER: ${{ steps.vars.outputs.flarum_version }}
+          INPUT_REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_REVISION}" ]; then
+            echo "revision=${INPUT_REVISION}" >>"$GITHUB_OUTPUT"
+            echo "using revision override: ${INPUT_REVISION}"
+            exit 0
+          fi
+          # Read the published mutable tag's image.version label
+          # (form: <flarum-version>-<revision>, e.g. 1.8.18-r1) and increment
+          # the trailing rN. Missing tag, missing label, or a non-rN suffix all
+          # fall back to r1 — covers the very first build of a version.
+          REF="${REGISTRY}/${IMAGE_NAME}:${FLARUM_VER}"
+          if cfg=$(crane config "${REF}" 2>/dev/null); then
+            prev=$(echo "${cfg}" | jq -r '.config.Labels["org.opencontainers.image.version"] // empty')
+            prev_rev="${prev##*-}"
+            case "${prev_rev}" in
+              r[0-9]*)
+                next=$(( ${prev_rev#r} + 1 ))
+                revision="r${next}"
+                ;;
+              *)
+                revision="r1"
+                ;;
+            esac
+          else
+            revision="r1"
+          fi
+          echo "computed revision: ${revision} (prev label: ${prev:-<none>})"
+          echo "revision=${revision}" >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image (local load)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          build-args: |
+            FLARUM_VERSION=${{ steps.vars.outputs.flarum_version }}
+            ALPINE_VERSION=${{ steps.vars.outputs.alpine_version }}
+            BASE_IMAGE=${{ steps.base.outputs.base_image }}
+            BASE_DIGEST=${{ steps.base.outputs.base_digest }}
+            IMAGE_REVISION=${{ steps.revision.outputs.revision }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.vars.outputs.build_date }}
+          tags: flarum:test
+          provenance: false
+
+      - name: Save image tarball
+        run: docker save flarum:test -o /tmp/image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: pip install -r tests/requirements.txt
+
+      - name: Image + runtime tests
+        env:
+          IMAGE: flarum:test
+          FLARUM_VERSION: ${{ needs.build.outputs.flarum_version }}
+          IMAGE_REVISION: ${{ needs.build.outputs.revision }}
+        run: pytest -v tests/ --junitxml=report.xml
+
+      - name: Dump flarum container logs on failure
+        if: failure()
+        run: |
+          for c in $(docker ps -a --filter "name=^fl-" --format '{{.Names}}'); do
+            echo "--- $c ---"
+            docker logs "$c" 2>&1 || true
+          done
+
+      - name: Upload pytest report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-report
+          path: report.xml
+          retention-days: 7
+
+  compose-test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - name: Bring up compose stack
+        env:
+          FLARUM_IMAGE: flarum:test
+        run: docker compose up -d
+
+      - name: Wait for the forum to return 200
+        run: |
+          for i in $(seq 1 90); do
+            code=$(curl -sf -o /dev/null -w '%{http_code}' http://localhost:8000/ || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "ready after ${i} polls"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "timed out waiting for http://localhost:8000/"
+          exit 1
+
+      - name: Assert clean first boot
+        run: |
+          restarts=$(docker inspect --format '{{.RestartCount}}' flarum-flarum-1)
+          echo "restart count: $restarts"
+          [ "$restarts" = "0" ] || exit 1
+          if docker compose logs flarum 2>&1 | grep -E 'PHP Fatal|RuntimeException|s6-overlay-suexec: fatal'; then
+            echo "found error markers in flarum logs"
+            exit 1
+          fi
+
+      - name: Assert the security patch is present in the running container
+        run: |
+          for m in EmailToken PasswordToken RegistrationToken; do
+            docker compose exec -T flarum \
+              grep -qF "protected \$keyType = 'string';" \
+              "/opt/flarum/vendor/flarum/core/src/User/${m}.php" \
+              || { echo "GHSA-55f2-h36g-96c3 patch missing from ${m}"; exit 1; }
+          done
+          echo "all three token models patched"
+
+      - name: Assert the scheduler sidecar came up
+        run: |
+          docker compose logs cron 2>&1 | grep -q "Sidecar cron container detected" \
+            || { echo "cron sidecar did not enter sidecar mode"; docker compose logs cron; exit 1; }
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    needs: [build, test, compose-test]
+    # Tag pushes always publish. Manual dispatch publishes unless the
+    # `publish` input is set to false (test-only runs).
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR is the primary registry and must never be blocked on Docker Hub
+      # credentials. Both are repo-level secrets; until they are set, the
+      # publish still happens, to GHCR only, and the step below says so.
+      - name: Log in to Docker Hub
+        id: dockerhub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Push refs to each registry:
+      #   <version>-<revision>   immutable (e.g. 1.8.18-r2). This exact build,
+      #                          never reused. Pin here for byte-for-byte
+      #                          reproducibility.
+      #   <version>              mutable Flarum-version alias (e.g. 1.8.18).
+      #                          Floats to the latest revision so Alpine and
+      #                          base-image security rebuilds land in place —
+      #                          users pinned here receive patches without
+      #                          re-pinning. This is the tag that carries the
+      #                          GHSA-55f2-h36g-96c3 backport forward.
+      #   latest                 floating pointer — stable MAJOR.MINOR.PATCH
+      #                          releases only; prereleases publish their own
+      #                          refs but never claim latest.
+      - name: Tag and push
+        env:
+          FLARUM_VER: ${{ needs.build.outputs.flarum_version }}
+          REVISION: ${{ needs.build.outputs.revision }}
+          DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/docker-flarum
+          DOCKERHUB_LOGGED_IN: ${{ steps.dockerhub.outcome }}
+        run: |
+          set -euo pipefail
+          is_stable=false
+          if [[ "${FLARUM_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            is_stable=true
+          fi
+          REPOS=("${REGISTRY}/${IMAGE_NAME}")
+          if [ "${DOCKERHUB_LOGGED_IN}" = "success" ]; then
+            REPOS+=("docker.io/${DOCKERHUB_REPO}")
+          else
+            echo "::warning::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN not set — publishing to GHCR only"
+          fi
+          for REPO in "${REPOS[@]}"; do
+            docker tag flarum:test "${REPO}:${FLARUM_VER}-${REVISION}"
+            docker tag flarum:test "${REPO}:${FLARUM_VER}"
+            docker push "${REPO}:${FLARUM_VER}-${REVISION}"
+            docker push "${REPO}:${FLARUM_VER}"
+            if [ "${is_stable}" = "true" ]; then
+              docker tag flarum:test "${REPO}:latest"
+              docker push "${REPO}:latest"
+            fi
+          done
