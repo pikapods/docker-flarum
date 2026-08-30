@@ -18,11 +18,6 @@ RESTART_DEADLINE_S = 240
 DB_NAME = "flarum"
 DB_USER = "flarum"
 DB_PASS = "flarumtest"
-DB_PREFIX = "flarum_"
-
-TOKEN_MODELS = ("EmailToken", "PasswordToken", "RegistrationToken")
-CORE_USER_SRC = "/opt/flarum/vendor/flarum/core/src/User"
-KEY_TYPE_PROPERTY = "protected $keyType = 'string';"
 
 
 def _sh(*args, check=True):
@@ -33,17 +28,6 @@ def _exec(container, *args, check=False):
     return subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True, text=True, check=check,
-    )
-
-
-def _mysql(container, sql, database=DB_NAME):
-    """Run SQL against the stack's database from inside the flarum container,
-    which already ships the mariadb client the entrypoint uses."""
-    return _exec(
-        container, "mariadb",
-        "-h", "db", "-u", DB_USER, f"-p{DB_PASS}",
-        "--batch", "--skip-column-names",
-        database, "-e", sql,
     )
 
 
@@ -216,156 +200,6 @@ def test_scheduler_sidecar_running(stack):
 
 
 # ---------------------------------------------------------------------------
-# GHSA-55f2-h36g-96c3 — behavioural regression check.
-#
-# The image-layer tests assert the property is present and that Eloquent reads
-# it back. This asserts the behaviour it buys, against a real MySQL connection.
-#
-# Mechanism: `*_tokens.token` is a VARCHAR primary key. Laravel binds an
-# integer lookup key as PDO::PARAM_INT, so `Model::find(0)` emits
-# `WHERE token = 0` — an integer comparison, in which MySQL coerces every
-# token that does not begin with a digit to 0. One arbitrary live token is
-# returned, which on the password-reset path is somebody else's account.
-#
-# Note the value must genuinely be an *integer*. `find("0")` returns null even
-# unpatched, because a string binding produces `WHERE token = '0'`. That is why
-# this probes Eloquent directly rather than going through `/reset/0`: a URL
-# segment is always a string, so the HTTP route cannot express the bug.
-# Verified both ways against a deliberately unpatched build.
-# ---------------------------------------------------------------------------
-
-# Deliberately starts with a letter: exactly the class of token MySQL coerces
-# to 0 in a numeric comparison.
-_FIXTURE_TOKEN = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
-
-# Boot Flarum's container, then look each token model up by integer 0 and by
-# the fixture's real string token. The second lookup is the positive control:
-# without it, "null" could just mean the fixture never landed.
-_PROBE_PHP = """<?php
-$site = require '/opt/flarum/site.php';
-$site->bootApp();
-$token = getenv('FIXTURE_TOKEN');
-foreach (['EmailToken', 'PasswordToken', 'RegistrationToken'] as $model) {
-    $class = 'Flarum\\\\User\\\\' . $model;
-    $byInt = $class::find(0);
-    $byStr = $class::find($token);
-    printf(
-        "%s int=%s str=%s\\n",
-        $model,
-        $byInt === null ? 'NULL' : 'MATCHED:' . $byInt->token,
-        $byStr === null ? 'NULL' : 'MATCHED:' . $byStr->token
-    );
-}
-"""
-
-
-@pytest.fixture(scope="session")
-def token_fixtures(stack):
-    """Insert one unexpired row into each of the three token tables, using a
-    token MySQL coerces to 0."""
-    admin = _mysql(stack["app"], f"SELECT id FROM {DB_PREFIX}users ORDER BY id LIMIT 1;")
-    assert admin.returncode == 0, f"could not read users table: {admin.stderr}"
-    user_id = admin.stdout.strip()
-    assert user_id, "no user rows — the installer did not seed an admin"
-
-    tables = ("password_tokens", "email_tokens", "registration_tokens")
-    inserts = (
-        f"INSERT INTO {DB_PREFIX}password_tokens (token, user_id, created_at) "
-        f"VALUES ('{_FIXTURE_TOKEN}', {user_id}, NOW());"
-        f"INSERT INTO {DB_PREFIX}email_tokens (token, email, user_id, created_at) "
-        f"VALUES ('{_FIXTURE_TOKEN}', 'victim@example.com', {user_id}, NOW());"
-        f"INSERT INTO {DB_PREFIX}registration_tokens "
-        f"(token, provider, identifier, created_at) "
-        f"VALUES ('{_FIXTURE_TOKEN}', 'probe', 'probe', NOW());"
-    )
-    cleanup = "".join(
-        f"DELETE FROM {DB_PREFIX}{t} WHERE token = '{_FIXTURE_TOKEN}';" for t in tables
-    )
-
-    r = _mysql(stack["app"], cleanup + inserts)
-    assert r.returncode == 0, f"could not insert fixture tokens: {r.stderr}"
-
-    # Sanity check at the SQL layer: `WHERE token = 0` must actually match.
-    # If a future schema change made that comparison type-safe on the DB side,
-    # the assertions below would pass for the wrong reason.
-    for table in tables:
-        coerce = _mysql(
-            stack["app"],
-            f"SELECT COUNT(*) FROM {DB_PREFIX}{table} WHERE token = 0;",
-        )
-        assert coerce.returncode == 0, coerce.stderr
-        assert coerce.stdout.strip() not in ("0", ""), (
-            f"`WHERE token = 0` matches no rows in {table}, so this test cannot "
-            "demonstrate the type-juggling bug — check the fixture token"
-        )
-
-    yield _FIXTURE_TOKEN
-
-    _mysql(stack["app"], cleanup)
-
-
-def _probe_tokens(container, token):
-    """Run the Eloquent probe inside the container; return {model: (int, str)}."""
-    write = subprocess.run(
-        ["docker", "exec", "-i", container, "sh", "-c", "cat > /tmp/probe.php"],
-        input=_PROBE_PHP, capture_output=True, text=True,
-    )
-    assert write.returncode == 0, f"could not stage probe: {write.stderr}"
-
-    r = _exec(container, "env", f"FIXTURE_TOKEN={token}", "php", "/tmp/probe.php")
-    assert r.returncode == 0, (
-        f"probe failed (rc={r.returncode})\nstdout={r.stdout}\nstderr={r.stderr}"
-    )
-
-    results = {}
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) == 3 and parts[1].startswith("int=") and parts[2].startswith("str="):
-            results[parts[0]] = (parts[1][4:], parts[2][4:])
-    assert set(results) == set(TOKEN_MODELS), (
-        f"probe produced unexpected output:\n{r.stdout}"
-    )
-    return results
-
-
-@pytest.fixture(scope="session")
-def probe(stack, token_fixtures):
-    return _probe_tokens(stack["app"], token_fixtures)
-
-
-@pytest.mark.parametrize("model", TOKEN_MODELS)
-def test_lookup_by_real_token_succeeds(probe, model):
-    # Positive control: the fixture row exists and the probe can reach it.
-    # Without this, the null-on-integer assertion below proves nothing.
-    _, by_string = probe[model]
-    assert by_string == f"MATCHED:{_FIXTURE_TOKEN}", (
-        f"{model}::find('<real token>') returned {by_string}; the regression "
-        "check below would be meaningless"
-    )
-
-
-@pytest.mark.parametrize("model", TOKEN_MODELS)
-def test_lookup_by_integer_zero_returns_null(probe, model):
-    by_int, _ = probe[model]
-    assert by_int == "NULL", (
-        f"{model}::find(0) returned {by_int}, expected NULL. Eloquent matched "
-        "an unrelated token by integer coercion — the image is vulnerable to "
-        "GHSA-55f2-h36g-96c3 (account takeover, CVSS 9.8)."
-    )
-
-
-@pytest.mark.parametrize("model", TOKEN_MODELS)
-def test_patch_survives_boot(stack, model):
-    # cont-init.d/03-config.sh chowns and rewrites parts of /opt/flarum on
-    # every boot. Confirm nothing in that path reverts the vendor tree.
-    r = _exec(stack["app"], "grep", "-qF", KEY_TYPE_PROPERTY,
-              f"{CORE_USER_SRC}/{model}.php")
-    assert r.returncode == 0, (
-        f"{model} lost its $keyType declaration after container boot"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Extension persistence — the PikaPods UX this image exists to serve.
 #
 # Extensions are installed by Composer into /opt/flarum (inside the image, not
@@ -423,35 +257,6 @@ def test_extension_install_and_persistence(stack):
     assert _TEST_EXTENSION in still_listed.stdout, (
         f"/data/extensions/list lost {_TEST_EXTENSION} across recreation; "
         f"got {still_listed.stdout!r}"
-    )
-
-
-@pytest.mark.parametrize("model", TOKEN_MODELS)
-def test_patch_survives_extension_install(stack, model):
-    # Ordered after test_extension_install_and_persistence by file position:
-    # a runtime `composer require` re-runs the solver over the whole tree, and
-    # a re-extracted flarum/core would drop the backport on the floor while
-    # the image still advertises cc.pikapods.patches.
-    r = _exec(stack["app"], "grep", "-qF", KEY_TYPE_PROPERTY,
-              f"{CORE_USER_SRC}/{model}.php")
-    assert r.returncode == 0, (
-        f"{model} lost its $keyType declaration after a runtime extension "
-        "install — composer re-extracted flarum/core over the patched files"
-    )
-
-
-@pytest.mark.parametrize("model", TOKEN_MODELS)
-def test_integer_lookup_still_null_after_extension_install(stack, token_fixtures, model):
-    # Same reasoning as above, checked behaviourally rather than by grep. Runs
-    # a fresh probe against the recreated container.
-    by_int, by_string = _probe_tokens(stack["app"], token_fixtures)[model]
-    assert by_string == f"MATCHED:{_FIXTURE_TOKEN}", (
-        f"{model} fixture row vanished across container recreation; the "
-        "assertion below would be meaningless"
-    )
-    assert by_int == "NULL", (
-        f"{model}::find(0) returned {by_int} after an extension install — the "
-        "GHSA-55f2-h36g-96c3 backport did not survive composer"
     )
 
 

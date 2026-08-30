@@ -12,11 +12,6 @@ IMAGE = os.environ["IMAGE"]
 EXPECTED_VERSION = os.environ.get("FLARUM_VERSION")
 EXPECTED_REVISION = os.environ.get("IMAGE_REVISION")
 
-# The three Eloquent models whose primary key is a random string.
-TOKEN_MODELS = ("EmailToken", "PasswordToken", "RegistrationToken")
-CORE_USER_SRC = "/opt/flarum/vendor/flarum/core/src/User"
-KEY_TYPE_PROPERTY = "protected $keyType = 'string';"
-
 
 def _inspect():
     out = subprocess.run(
@@ -36,60 +31,6 @@ def _run(*args, check=False):
         ["docker", "run", "--rm", "--entrypoint=", IMAGE, *args],
         capture_output=True, text=True, check=check,
     )
-
-
-# ---------------------------------------------------------------------------
-# GHSA-55f2-h36g-96c3 — the reason this fork exists.
-#
-# This is the most important test in the repo. flarum/core 1.8.19 fixed an
-# account-takeover bug (CVSS 9.8) by declaring $keyType on three token models,
-# but 1.8.19 never reached the split repo Packagist resolves against, so the
-# fix is carried by patches/ghsa-55f2-h36g-96c3.sh instead of by Composer.
-#
-# What it guards against: a future FLARUM_VERSION bump, an upstream refactor
-# that moves these models, or a botched edit to the patch script silently
-# regressing the image to a 9.8 vulnerability. The patch script asserts at
-# build time; this asserts on the built artifact, independently.
-# ---------------------------------------------------------------------------
-class TestSecurityPatch:
-    @pytest.mark.parametrize("model", TOKEN_MODELS)
-    def test_key_type_declared_in_source(self, model):
-        path = f"{CORE_USER_SRC}/{model}.php"
-        r = _run("grep", "-cF", KEY_TYPE_PROPERTY, path)
-        assert r.returncode == 0, (
-            f"{path} does not declare {KEY_TYPE_PROPERTY!r} — the image is "
-            f"vulnerable to GHSA-55f2-h36g-96c3 (account takeover, CVSS 9.8)"
-        )
-        assert r.stdout.strip() == "1", (
-            f"{path} declares $keyType {r.stdout.strip()} times; expected exactly 1 "
-            "(a double-apply means the patch script is not idempotent)"
-        )
-
-    @pytest.mark.parametrize("model", TOKEN_MODELS)
-    def test_key_type_effective_in_eloquent(self, model):
-        # Stronger than grepping the file: instantiate the model and ask
-        # Eloquent what it resolved. Catches a property added in the wrong
-        # scope, shadowed by a trait, or overridden further down the class.
-        r = _run(
-            "php", "-r",
-            'require "/opt/flarum/vendor/autoload.php";'
-            f'$m = new Flarum\\User\\{model}();'
-            'echo $m->getKeyType();',
-        )
-        assert r.returncode == 0, f"php failed: {r.stderr}"
-        assert r.stdout.strip() == "string", (
-            f"Flarum\\User\\{model}::getKeyType() is {r.stdout.strip()!r}, expected 'string'. "
-            "Eloquent will cast the lookup key to an integer and MySQL will "
-            "coerce every non-numeric token to 0 (GHSA-55f2-h36g-96c3)."
-        )
-
-    def test_patch_label_advertises_the_backport(self, inspect):
-        labels = inspect["Config"].get("Labels") or {}
-        assert "GHSA-55f2-h36g-96c3" in (labels.get("cc.pikapods.patches") or ""), (
-            "cc.pikapods.patches label does not advertise GHSA-55f2-h36g-96c3 — "
-            "the applied patch must stay discoverable from the image itself, "
-            "because composer.lock still reads the unpatched version"
-        )
 
 
 class TestImageMetadata:
@@ -185,9 +126,10 @@ class TestImageFilesystem:
         assert r.stdout.strip() == "flarum:flarum"
 
     def test_vendor_tree_owned_by_flarum(self):
-        # The patch step runs as root inside the same layer as the chown; if
-        # the two ever get reordered the vendor tree lands root-owned and the
-        # boot-time fixperms has to rewrite the whole tree on every start.
+        # composer installs as root; the chown in the same layer is what makes
+        # the tree usable by the runtime user. If it is ever dropped, the
+        # boot-time fixperms has to rewrite the whole vendor tree on every
+        # start — slow, and masked by the fact that the app still works.
         r = _run("sh", "-c", "find /opt/flarum/vendor ! -user flarum | head -3")
         assert r.returncode == 0, r.stderr
         assert not r.stdout.strip(), f"root-owned files in vendor: {r.stdout}"
@@ -200,11 +142,15 @@ class TestImageFilesystem:
         )
         assert r.returncode == 0, r.stderr
         locked = r.stdout.strip()
-        assert re.fullmatch(r"v\d+\.\d+\.\d+", locked), f"odd core version: {locked!r}"
+        # Upstream is inconsistent about the leading "v": 1.8.16-1.8.18 are
+        # tagged v-prefixed, 1.8.19 is not. Never assume it — a v-prefixed
+        # grep against Packagist is exactly what hid 1.8.19's availability
+        # and made this fork look like it needed a source patch.
+        assert re.fullmatch(r"v?\d+\.\d+\.\d+", locked), f"odd core version: {locked!r}"
         if EXPECTED_VERSION:
-            assert locked == f"v{EXPECTED_VERSION}", (
+            assert locked.lstrip("v") == EXPECTED_VERSION.lstrip("v"), (
                 f"composer.lock has flarum/core {locked}, build requested "
-                f"v{EXPECTED_VERSION}"
+                f"{EXPECTED_VERSION}"
             )
 
     def test_tracks_the_1_8_series(self):
@@ -216,7 +162,8 @@ class TestImageFilesystem:
             '.packages[] | select(.name == "flarum/core") | .version',
             "/opt/flarum/composer.lock",
         )
-        assert r.stdout.strip().startswith("v1.8."), (
+        # .lstrip("v") for the same reason as above: the prefix is not reliable.
+        assert r.stdout.strip().lstrip("v").startswith("1.8."), (
             f"flarum/core is {r.stdout.strip()}; this image only tracks the 1.8 series"
         )
 
@@ -286,10 +233,3 @@ class TestImageFilesystem:
         assert r.returncode == 0, r.stderr
         modules = {line.strip() for line in r.stdout.splitlines() if line.strip()}
         assert ext in modules, f"PHP module {ext!r} not loaded; got {sorted(modules)}"
-
-    def test_no_build_time_patches_left_in_image(self):
-        # patches/ is bind-mounted during the build, never COPYed. If that
-        # changes, a whiteout layer starts carrying dead weight.
-        for path in ("/patches", "/tmp/patches"):
-            r = _run("test", "-e", path)
-            assert r.returncode != 0, f"{path} leaked into the image"

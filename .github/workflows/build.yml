@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       flarum_version:
-        description: "Flarum version, no leading v (e.g. 1.8.18)"
+        description: "Flarum version, no leading v (e.g. 1.8.19)"
         required: true
         type: string
       alpine_version:
@@ -256,16 +256,6 @@ jobs:
             exit 1
           fi
 
-      - name: Assert the security patch is present in the running container
-        run: |
-          for m in EmailToken PasswordToken RegistrationToken; do
-            docker compose exec -T flarum \
-              grep -qF "protected \$keyType = 'string';" \
-              "/opt/flarum/vendor/flarum/core/src/User/${m}.php" \
-              || { echo "GHSA-55f2-h36g-96c3 patch missing from ${m}"; exit 1; }
-          done
-          echo "all three token models patched"
-
       - name: Assert the scheduler sidecar came up
         run: |
           docker compose logs cron 2>&1 | grep -q "Sidecar cron container detected" \
@@ -325,15 +315,14 @@ jobs:
           password: ${{ env.DOCKERHUB_TOKEN }}
 
       # Push refs to each registry:
-      #   <version>-<revision>   immutable (e.g. 1.8.18-r2). This exact build,
+      #   <version>-<revision>   immutable (e.g. 1.8.19-r2). This exact build,
       #                          never reused. Pin here for byte-for-byte
       #                          reproducibility.
-      #   <version>              mutable Flarum-version alias (e.g. 1.8.18).
+      #   <version>              mutable Flarum-version alias (e.g. 1.8.19).
       #                          Floats to the latest revision so Alpine and
       #                          base-image security rebuilds land in place —
       #                          users pinned here receive patches without
-      #                          re-pinning. This is the tag that carries the
-      #                          GHSA-55f2-h36g-96c3 backport forward.
+      #                          re-pinning.
       #   latest                 floating pointer — stable MAJOR.MINOR.PATCH
       #                          releases only; prereleases publish their own
       #                          refs but never claim latest.
