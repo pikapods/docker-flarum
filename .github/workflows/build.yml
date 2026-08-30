@@ -288,6 +288,12 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # Surfaced as env because the `secrets` context is not available in a
+    # step-level `if` — only `env` is. This is what lets the Docker Hub push
+    # be skipped when its credentials have not been set on the repo.
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -312,11 +318,11 @@ jobs:
       # publish still happens, to GHCR only, and the step below says so.
       - name: Log in to Docker Hub
         id: dockerhub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
       # Push refs to each registry:
       #   <version>-<revision>   immutable (e.g. 1.8.18-r2). This exact build,
