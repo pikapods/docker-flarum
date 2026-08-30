@@ -1,6 +1,12 @@
 #!/bin/sh
 set -e
 
+# Do not trust the caller's PATH: crond supplies one today, but anything
+# invoked from a php-fpm worker (clear_env=yes) would not. See the note in
+# /usr/local/bin/extension.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
 cd /opt/flarum || exit 1
 
 if [ "$(id -u)" -eq 0 ]; then

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 
 import pytest
@@ -24,6 +25,24 @@ def _inspect():
 @pytest.fixture(scope="session")
 def inspect():
     return _inspect()
+
+
+@pytest.fixture(scope="session")
+def composer_hook():
+    """The Composer hook string as the image actually writes it.
+
+    Derived from the image rather than duplicated here, so the regression test
+    below cannot drift from `install_hook`. The single-entry assertion is the
+    dedupe invariant: `install-hook` must strip prior forms of the hook before
+    appending the current one.
+    """
+    r = _run("sh", "-c",
+             "/bin/sh /usr/local/bin/extension install-hook >/dev/null && "
+             "jq -r '.scripts[\"post-update-cmd\"][]' /opt/flarum/composer.json")
+    assert r.returncode == 0, r.stderr
+    hooks = [l for l in r.stdout.splitlines() if "/usr/local/bin/extension" in l]
+    assert len(hooks) == 1, f"expected exactly one extension hook, got {hooks}"
+    return hooks[0]
 
 
 def _run(*args, check=False):
@@ -205,6 +224,71 @@ class TestImageFilesystem:
         r = _run("test", "-x", helper)
         assert r.returncode == 0, f"{helper} missing or not executable"
 
+    # -------------------------------------------------------------------
+    # Composer hook under a php-fpm worker environment.
+    #
+    # php-fpm runs with clear_env=yes, so a worker starts with NO PATH.
+    # Composer -- run in-process by flarum/extension-manager -- then sets
+    # PATH="<bin-dir>:" before dispatching post-install-cmd/post-update-cmd.
+    # That value is non-empty, so the shell does not fall back to its built-in
+    # default, but it contains nothing the helper needs: every bare command
+    # exits 127. test_extension_install_and_persistence in test_runtime.py
+    # drives the helper from a normal CLI environment, which is exactly why
+    # this shipped broken in 1.8.19-r1.
+    # -------------------------------------------------------------------
+
+    def test_php_fpm_template_restores_path(self):
+        r = _run("grep", "-E", r"^env\[PATH\]",
+                 "/tpls/etc/php84/php-fpm.d/www.conf")
+        assert r.returncode == 0, (
+            "php-fpm pool declares no env[PATH]; with clear_env=yes the pool "
+            "is the only place a worker's PATH can come from"
+        )
+        assert "/usr/bin" in r.stdout and "/usr/local/bin" in r.stdout, r.stdout
+
+    def test_extension_helper_does_not_trust_caller_path(self):
+        r = _run("cat", "/usr/local/bin/extension")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines()[0] == "#!/bin/sh", (
+            f"unexpected shebang: {r.stdout.splitlines()[0]!r}"
+        )
+        assert "export PATH" in r.stdout, (
+            "the helper must set its own PATH -- a php-fpm worker gives it a "
+            "PATH containing only vendor/bin"
+        )
+
+    def test_composer_hook_is_not_path_dependent(self, composer_hook):
+        interpreter = composer_hook.split()[0]
+        assert interpreter.startswith("/"), (
+            f"hook {composer_hook!r} invokes {interpreter!r} by bare name; it "
+            "is resolved against Composer's PATH, which has no /bin"
+        )
+
+    def test_composer_hook_runs_under_php_fpm_stripped_env(self, composer_hook):
+        # Reproduce the worker environment verbatim: unprivileged, env -i, and
+        # Composer's synthetic PATH. The gosu drop matters -- it puts the run
+        # on the same `id -u != 0` branch (sync_list in-process) the worker
+        # takes. /data/extensions needs the chown because the anonymous /data
+        # volume is root-owned.
+        script = (
+            "set -e\n"
+            "mkdir -p /data/extensions\n"
+            "chown -R flarum:flarum /data/extensions\n"
+            "/bin/sh /usr/local/bin/extension baseline\n"
+            "gosu flarum:flarum /usr/bin/env -i PATH=/opt/flarum/vendor/bin: "
+            f"/bin/sh -c {shlex.quote(composer_hook)}\n"
+            "test -f /data/extensions/list\n"
+        )
+        r = _run("sh", "-c", script)
+        assert r.returncode == 0, (
+            f"composer post-update hook failed under a stripped php-fpm "
+            f"environment (rc={r.returncode})\n"
+            f"stdout={r.stdout!r}\nstderr={r.stderr!r}"
+        )
+        assert "not found" not in (r.stdout + r.stderr), (
+            f"a command in the hook was unresolvable:\n{r.stdout}{r.stderr}"
+        )
+
     def test_extension_helper_usage(self):
         # The extension helper is the documented UX for PikaPods users; a
         # broken shebang or a syntax error only surfaces when invoked.
@@ -216,6 +300,12 @@ class TestImageFilesystem:
 
     @pytest.mark.parametrize("binary", [
         "php", "nginx", "php-fpm84", "composer", "gosu", "mariadb", "jq", "curl", "bash",
+        # Composer probes for unzip via Symfony's ExecutableFinder, i.e. via
+        # PATH. It is the busybox applet here, from the base image rather than
+        # our apk list -- so a base change could drop it and Composer would
+        # silently fall back to the PHP zip extension, losing archive file
+        # permissions.
+        "unzip",
     ])
     def test_runtime_binaries_present(self, binary):
         r = _run("which", binary)

@@ -25,9 +25,9 @@ Source: https://github.com/pikapods/docker-flarum
 ## Why this fork
 
 Upstream `crazymax/flarum` is a well-built image, and its runtime is kept here
-**verbatim** — the s6-overlay v2 init scripts, the `extension` helper, the
-scheduler, and the nginx/PHP templates are all upstream's, unmodified. What
-this fork changes is the build and the release cadence:
+**almost verbatim** — the s6-overlay v2 init scripts, the `extension` helper,
+the scheduler, and the nginx/PHP templates are upstream's. What this fork
+changes is the build and the release cadence:
 
 - **Predictable rebuilds.** Upstream publishes in bursts (1.8.10 → 1.8.17 was
   a 13-month gap), and a versioned tag only appears when the maintainer cuts a
@@ -41,6 +41,12 @@ this fork changes is the build and the release cadence:
 - **A test suite.** 80-odd assertions across an image lane and a runtime lane
   that boots against MariaDB, covering the install, the `/data` layout, the
   scheduler sidecar and the extension persistence cycle.
+
+`rootfs/` carries exactly one deviation from upstream: the php-fpm pool sets
+an explicit `env[PATH]`, and the `extension` helper no longer trusts the
+caller's `PATH`. Without it, Flarum's Extension Manager cannot install or
+update anything — see [Extensions](#extensions). The bug is upstream's and the
+fix belongs there; this deviation should disappear once it lands.
 
 This image tracks the **Flarum 1.8 series only**. Flarum 2.0 is still at
 release-candidate stage with no GA date.
@@ -125,6 +131,7 @@ this fork changes none of it. The commonly-used subset:
 | `REAL_IP_HEADER`   | `X-Forwarded-For` | Header carrying the client IP.                               |
 | `SIDECAR_CRON`     | `0`           | `1` turns the container into a scheduler-only sidecar.           |
 | `CRON_SCHEDULE`    | `* * * * *`   | Scheduler cadence (sidecar mode only).                           |
+| `CLEAR_ENV`        | `yes`         | Clear each php-fpm worker's environment, keeping DB credentials out of `$_SERVER`/`phpinfo()`. The pool sets an explicit `env[PATH]` so Composer scripts still work. |
 
 ## Scheduler
 
@@ -144,6 +151,10 @@ docker compose exec flarum extension require fof/upload
 docker compose exec flarum extension list
 docker compose exec flarum extension remove fof/upload
 ```
+
+Admin → **Extension Manager** is supported and goes through the same
+`post-install-cmd` / `post-update-cmd` hook as the CLI, so extensions installed
+from the web UI are mirrored to `/data/extensions/list` too.
 
 Editing `/data/extensions/list` by hand still works, but is no longer
 necessary: the Composer post-install hook keeps the file in sync
@@ -198,6 +209,16 @@ CI additionally passes `BASE_IMAGE` (digest-pinned), `BASE_DIGEST`,
 > tag is s6-overlay **v3** (`/etc/s6-overlay/s6-rc.d`) and would require
 > rewriting every init script under `rootfs/`. `tests/test_image.py` asserts
 > both the label and the on-disk layout to catch an accidental bump.
+
+> **Anything reachable from `/opt/flarum/composer.json` scripts runs in a
+> php-fpm worker.** That worker has `clear_env=yes` (no environment at all),
+> and Composer then sets `PATH` to `<bin-dir>:` before dispatching
+> `post-install-cmd` / `post-update-cmd` — non-empty, so the shell never falls
+> back to its built-in default, and containing neither `/bin` nor `/usr/bin`.
+> A new helper must therefore export its own `PATH` and be referenced by
+> absolute interpreter path (`/bin/sh /usr/local/bin/…`, never `sh …`).
+> `tests/test_image.py::test_composer_hook_runs_under_php_fpm_stripped_env`
+> reproduces that environment.
 
 ## Testing
 

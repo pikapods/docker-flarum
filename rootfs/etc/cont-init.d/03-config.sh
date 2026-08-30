@@ -111,8 +111,8 @@ chown -h flarum:flarum /opt/flarum/extensions /opt/flarum/public/assets /opt/fla
 fixperms /data/assets /data/extensions /data/storage /opt/flarum/vendor
 
 echo "Configuring extension persistence..."
-gosu flarum:flarum sh /usr/local/bin/extension install-hook
-gosu flarum:flarum sh /usr/local/bin/extension baseline
+gosu flarum:flarum /bin/sh /usr/local/bin/extension install-hook
+gosu flarum:flarum /bin/sh /usr/local/bin/extension baseline
 
 echo "Checking parameters..."
 if [ -z "$FLARUM_BASE_URL" ]; then
@@ -250,7 +250,7 @@ if [ -s "/data/extensions/list" ]; then
   if [ "${#extensions[@]}" -gt 0 ]; then
     echo "Installing additional extensions..."
     COMPOSER_CACHE_DIR="/data/extensions/.cache" gosu flarum:flarum composer require --working-dir /opt/flarum "${extensions[@]}"
-    gosu flarum:flarum sh /usr/local/bin/extension sync
+    gosu flarum:flarum /bin/sh /usr/local/bin/extension sync
   fi
 fi
 

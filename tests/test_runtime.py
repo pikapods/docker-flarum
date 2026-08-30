@@ -260,6 +260,73 @@ def test_extension_install_and_persistence(stack):
     )
 
 
+# ---------------------------------------------------------------------------
+# php-fpm worker environment.
+#
+# clear_env=yes clears a worker's environment, so the pool's env[PATH] is the
+# only thing standing between Flarum's Extension Manager and `sh: not found`
+# on every Composer script it dispatches. The tests above drive the helper
+# from a normal CLI environment and cannot see this.
+#
+# These come after the extension tests deliberately: the persistence test
+# recreates stack["app"] mid-session, so ordering in this module matters.
+# ---------------------------------------------------------------------------
+
+def test_php_fpm_pool_exports_path(stack):
+    # Assert the *rendered* pool, not the template -- catches a template edit
+    # that the sed in 03-config.sh drops on the floor.
+    r = _exec(stack["app"], "grep", "-E", r"^env\[PATH\]",
+              "/etc/php84/php-fpm.d/www.conf")
+    assert r.returncode == 0, (
+        "rendered php-fpm pool has no env[PATH]; workers will run with an "
+        "empty environment"
+    )
+    assert "/usr/bin" in r.stdout, r.stdout
+
+
+def test_composer_hook_under_stripped_env(stack):
+    # Same shape as the image-lane regression test, but against a real boot:
+    # the baseline file and /data/extensions already exist, and /data is the
+    # real volume rather than an anonymous one.
+    r = _exec(stack["app"], "jq", "-r",
+              '.scripts["post-update-cmd"][]', "/opt/flarum/composer.json")
+    assert r.returncode == 0, r.stderr
+    hooks = [l for l in r.stdout.splitlines() if "/usr/local/bin/extension" in l]
+    assert len(hooks) == 1, f"expected exactly one extension hook, got {hooks}"
+
+    r = _exec(stack["app"], "gosu", "flarum:flarum",
+              "/usr/bin/env", "-i", "PATH=/opt/flarum/vendor/bin:",
+              "/bin/sh", "-c", hooks[0])
+    assert r.returncode == 0, (
+        f"post-update hook failed under a stripped environment "
+        f"(rc={r.returncode})\nstdout={r.stdout!r}\nstderr={r.stderr!r}"
+    )
+    assert "not found" not in (r.stdout + r.stderr), r.stdout + r.stderr
+
+
+def test_php_fpm_workers_see_a_usable_path(stack):
+    # The only test that proves the fix rather than its configuration: it goes
+    # through nginx -> FastCGI -> a real worker.
+    #
+    # Do NOT substitute a read of /proc/<pid>/environ here. Workers are
+    # fork()ed, not exec()ed, so clearenv()/setenv() never rewrite the kernel's
+    # env region -- /proc would show the master's pre-clear environment and the
+    # test would pass with or without the fix.
+    probe = "/opt/flarum/public/_pathprobe.php"
+    try:
+        w = _exec(stack["app"], "sh", "-c",
+                  f"""printf '%s' '<?php echo getenv("PATH") ?: "UNSET";' > {probe}""")
+        assert w.returncode == 0, w.stderr
+        status, body = _http(f"{stack['base_url']}/_pathprobe.php")
+        assert status == 200, f"probe returned {status}: {body[:200]}"
+        assert "/usr/bin" in body, (
+            f"php-fpm worker PATH is {body!r} -- Composer scripts dispatched "
+            "by the Extension Manager will fail with 'not found'"
+        )
+    finally:
+        _exec(stack["app"], "rm", "-f", probe)
+
+
 def test_healthcheck_status_if_defined(stack):
     r = _sh("docker", "inspect", "--format", "{{json .State.Health}}", stack["app"])
     health = json.loads(r.stdout) if r.stdout.strip() else None

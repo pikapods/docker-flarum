@@ -19,7 +19,7 @@ touch "${CRONTAB_PATH}/flarum"
 
 if [ -n "$CRON_SCHEDULE" ]; then
   echo "Creating Flarum scheduler cron task with the following period fields: $CRON_SCHEDULE"
-  echo "${CRON_SCHEDULE} sh /usr/local/bin/flarum_scheduler" >>"${CRONTAB_PATH}/flarum"
+  echo "${CRON_SCHEDULE} /bin/sh /usr/local/bin/flarum_scheduler" >>"${CRONTAB_PATH}/flarum"
 else
   echo "CRON_SCHEDULE env var empty..."
 fi

@@ -1,7 +1,15 @@
-#!/usr/bin/env sh
+#!/bin/sh
 set -e
 
-HOOK_COMMAND="sh /usr/local/bin/extension sync"
+# php-fpm runs with clear_env=yes, so a worker has no PATH. Composer (run
+# in-process by flarum/extension-manager) then sets PATH to "<bin-dir>:" before
+# dispatching post-install-cmd/post-update-cmd -- non-empty, so the shell does
+# not fall back to its built-in default, but containing nothing this script
+# needs. Never trust the caller's PATH here.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+HOOK_COMMAND="/bin/sh /usr/local/bin/extension sync"
 
 BASE_PATH="${FLARUM_EXTENSION_BASE:-/opt/flarum}"
 EXTS_CACHE_DIR="${FLARUM_EXTENSION_CACHE:-/data/extensions/.cache}"
@@ -43,7 +51,7 @@ composer_remove() {
 
 sync_as_flarum() {
   if [ "$(id -u)" -eq 0 ]; then
-    gosu flarum:flarum sh /usr/local/bin/extension sync
+    gosu flarum:flarum /bin/sh /usr/local/bin/extension sync
   else
     sync_list
   fi
@@ -64,22 +72,20 @@ install_hook() {
   dir=$(dirname "${COMPOSER_JSON}")
   tmp=$(mktemp -p "${dir}" composer.json.XXXXXX)
 
+  # Strip any previous form of the hook before appending the current one, so
+  # the rewrite stays idempotent even when HOOK_COMMAND changes. Other user
+  # scripts in these arrays are preserved, in order.
   jq --arg cmd "${HOOK_COMMAND}" '
-    .scripts = (.scripts // {}) |
-    (.scripts["post-install-cmd"] // []) as $install |
-    (.scripts["post-update-cmd"] // []) as $update |
-    .scripts["post-install-cmd"] = (
-      (if ($install | type) == "array" then $install
-      elif ($install | type) == "string" then [$install]
-      else [] end) as $commands |
-      if ($commands | index($cmd)) then $commands else $commands + [$cmd] end
-    ) |
-    .scripts["post-update-cmd"] = (
-      (if ($update | type) == "array" then $update
-      elif ($update | type) == "string" then [$update]
-      else [] end) as $commands |
-      if ($commands | index($cmd)) then $commands else $commands + [$cmd] end
-    )
+    def norm($v):
+      if ($v|type) == "array" then $v
+      elif ($v|type) == "string" then [$v]
+      else [] end;
+    def clean($v):
+      norm($v) | map(select((type == "string"
+                             and test("/usr/local/bin/extension[[:space:]]+sync")) | not));
+    .scripts = (.scripts // {})
+    | .scripts["post-install-cmd"] = (clean(.scripts["post-install-cmd"]) + [$cmd])
+    | .scripts["post-update-cmd"]  = (clean(.scripts["post-update-cmd"]) + [$cmd])
   ' "${COMPOSER_JSON}" >"${tmp}"
 
   mv "${tmp}" "${COMPOSER_JSON}"
